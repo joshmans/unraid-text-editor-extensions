@@ -27,7 +27,7 @@ In Unraid, go to **Plugins → Install Plugin** and paste:
 https://raw.githubusercontent.com/joshmans/unraid-text-editor-extensions/main/text.editor.extensions.plg
 ```
 
-Requires Unraid 6.10 or newer (the File Manager that reads `editor.cfg`). There is nothing to configure: open **Settings → Utilities → Editable File Types**, tick what you want and press **Apply**.
+It should work on Unraid 7.0 and newer, but it has only been tested on 7.2 and newer (see *Tested*). There is nothing to configure: open **Settings → Utilities → Editable File Types**, tick what you want and press **Apply**.
 
 ## Format
 
@@ -46,6 +46,8 @@ The page writes that format. As a safety net, a file that has commas and no newl
 Removing the plugin deletes only its own page. **`/boot/config/editor.cfg` is left as it is**, so the extensions you chose keep working, and the `.bak` and `.orig` backups stay next to it.
 
 ## Tested
+
+Only on **Unraid 7.2 and newer**. Nothing in the plugin depends on a 7.2 feature, so 7.0 and 7.1 should work, but it has not been run on them.
 
 - Installs and registers on **Unraid 7.4.0-beta.3** (checked 2026-09-25), and the page's PHP passes `php -l` and renders without warnings.
 - Used on an Unraid 7.4.0-beta.2 server: saving from the page wrote `editor.cfg` and created the `.bak` and `.orig` backups.
