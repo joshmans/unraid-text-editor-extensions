@@ -1,0 +1,322 @@
+<?xml version="1.0" standalone="yes"?>
+
+<!--
+  Unraid Plugin: text.editor.extensions
+  ============================================================================
+  Adds a settings page (Settings -> Utilities -> Editable File Types) that
+  controls which file extensions Unraid's built-in File Manager will open
+  in its text editor/preview, by writing to /boot/config/editor.cfg.
+
+  Background / how this works:
+  Unraid's File Manager (dynamix.file.manager, standard since 6.10) checks
+  /boot/config/editor.cfg to decide whether a clicked file should open in
+  the in-browser text editor instead of just downloading/previewing as
+  binary. This is the same file that Unraid staff/users reference in the
+  forums for enabling extensions like yaml, md, json, etc.
+
+  FORMAT: editor.cfg holds one extension per line (confirmed by inspecting
+  a live file). This plugin reads/writes that newline-separated format by
+  default. As a safety net it still detects a comma-separated file (only
+  used if a file with commas but no newlines is found) and preserves that
+  format rather than rewriting it, and it always writes an editor.cfg.bak
+  backup before saving. A raw text editor is included on the same page so
+  you can always see/fix the exact file contents by hand if needed.
+
+  Install: Plugins -> Install Plugin, paste
+    https://raw.githubusercontent.com/joshmans/unraid-text-editor-extensions/main/text.editor.extensions.plg
+-->
+
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "text.editor.extensions">
+<!ENTITY author    "shwa87">
+<!ENTITY version   "2026.09.25">
+<!ENTITY launch    "Settings/TextEditorExtensions">
+<!ENTITY gitURL    "https://github.com/joshmans/unraid-text-editor-extensions">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/joshmans/unraid-text-editor-extensions/main/text.editor.extensions.plg">
+]>
+
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" icon="file-text-o" min="6.10" support="&gitURL;/issues">
+
+<CHANGES>
+###2026.09.25
+- Now published on GitHub (https://github.com/joshmans/unraid-text-editor-extensions): the plugin has a real update URL and support link instead of a placeholder. No other change.
+
+###2026.08.10.5
+- Update author to shwa87
+
+###2026.08.10.4
+- Remove background/border from restore buttons row; add hover tooltips showing which backup file each button uses
+- Add "Undo Last Change" and "Restore Original" buttons (editor.cfg.bak / editor.cfg.orig)
+
+###2026.08.10.2
+- Default new/empty editor.cfg to one-extension-per-line format (confirmed real format)
+
+###2026.08.10.1
+- Fix: remove broken self-download FILE block that caused install failures
+
+###2026.08.10
+- Initial release: manage /boot/config/editor.cfg from the webGUI
+</CHANGES>
+
+<!-- The settings page itself -->
+<FILE Name="/usr/local/emhttp/plugins/&name;/TextEditorExtensions.page">
+<INLINE>
+<![CDATA[
+Menu="Utilities:5"
+Title="Editable File Types"
+Icon="fa-file-text-o"
+---
+<?php
+/*
+  Manage which file extensions Unraid's File Manager will open in its
+  text editor/preview, by editing /boot/config/editor.cfg.
+*/
+
+$cfgFile = "/boot/config/editor.cfg";
+
+$suggested = [
+  'json'       => 'JSON data / config files',
+  'yaml'       => 'YAML config files',
+  'yml'        => 'YAML config files (short extension)',
+  'toml'       => 'TOML config files',
+  'ini'        => 'INI config files',
+  'md'         => 'Markdown documents',
+  'env'        => 'Environment variable files (.env)',
+  'properties' => 'Java-style .properties files',
+  'conf'       => 'Generic .conf config files',
+  'cfg'        => 'Generic .cfg config files',
+  'service'    => 'systemd unit files',
+  'timer'      => 'systemd timer files',
+  'log'        => 'Plain text log files',
+  'csv'        => 'Comma-separated data files',
+  'xml'        => 'XML files',
+  'htaccess'   => 'Apache .htaccess files',
+  'gitignore'  => 'Git ignore rules',
+];
+
+function tee_read_editor_cfg($file) {
+  if (!file_exists($file)) {
+    return ['list' => [], 'raw' => '', 'delim' => 'newline', 'exists' => false];
+  }
+  $raw = @file_get_contents($file);
+  if ($raw === false) $raw = '';
+  // editor.cfg uses one extension per line. Only fall back to comma-separated
+  // if the file has commas but no newlines at all (older/manual format).
+  $hasNewline = (strpos($raw, "\n") !== false) || (strpos($raw, "\r") !== false);
+  $delim = (!$hasNewline && strpos($raw, ",") !== false) ? 'comma' : 'newline';
+  $parts = preg_split('/[,\r\n]+/', $raw);
+  $parts = array_values(array_filter(array_map('trim', $parts), function ($v) { return $v !== ''; }));
+  return ['list' => $parts, 'raw' => $raw, 'delim' => $delim, 'exists' => true];
+}
+
+function tee_write_editor_cfg($file, $content) {
+  // Preserve the very first, pristine copy exactly once, before this plugin
+  // ever touches the file. This is what "Restore Original" rolls back to.
+  $origFile = $file . '.orig';
+  if (file_exists($file) && !file_exists($origFile)) {
+    @copy($file, $origFile);
+  }
+  if (file_exists($file)) {
+    @copy($file, $file . '.bak');
+  }
+  return @file_put_contents($file, $content) !== false;
+}
+
+function tee_restore_from($backupFile, $targetFile) {
+  if (!file_exists($backupFile)) return false;
+  // Read the backup's content BEFORE touching anything else — this matters
+  // because for "undo last change" the backup being restored from IS
+  // targetFile.bak, so it must not be overwritten before we've read it.
+  $content = @file_get_contents($backupFile);
+  if ($content === false) return false;
+  // Now it's safe to preserve the current (about-to-be-overwritten) state,
+  // so both "Undo Last Change" and "Restore Original" remain recoverable.
+  if (file_exists($targetFile)) {
+    @copy($targetFile, $targetFile . '.bak');
+  }
+  return @file_put_contents($targetFile, $content) !== false;
+}
+
+$state   = tee_read_editor_cfg($cfgFile);
+$current = $state['list'];
+$message = '';
+$error   = '';
+
+// Capture a pristine snapshot the first time this page ever sees the file,
+// before any edits are made through this plugin.
+$origFile = $cfgFile . '.orig';
+if ($state['exists'] && !file_exists($origFile)) {
+  @copy($cfgFile, $origFile);
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+  if (isset($_POST['restore_original'])) {
+    if (tee_restore_from($origFile, $cfgFile)) {
+      $message = "Restored editor.cfg to its original contents (from before this plugin made any changes). Your pre-restore state was saved to editor.cfg.bak.";
+    } else {
+      $error = "No original backup found to restore from (editor.cfg.orig is missing).";
+    }
+    $state   = tee_read_editor_cfg($cfgFile);
+    $current = $state['list'];
+
+  } elseif (isset($_POST['undo_last'])) {
+    $bakFile = $cfgFile . '.bak';
+    if (tee_restore_from($bakFile, $cfgFile)) {
+      $message = "Undid the last change to editor.cfg.";
+    } else {
+      $error = "No previous backup found to undo to (editor.cfg.bak is missing).";
+    }
+    $state   = tee_read_editor_cfg($cfgFile);
+    $current = $state['list'];
+
+  } elseif (isset($_POST['raw_save'])) {
+    $newRaw = isset($_POST['raw_content']) ? $_POST['raw_content'] : '';
+    if (tee_write_editor_cfg($cfgFile, $newRaw)) {
+      $message = "Saved raw contents of editor.cfg (backup written to editor.cfg.bak).";
+    } else {
+      $error = "Failed to write $cfgFile — check flash drive permissions.";
+    }
+    $state   = tee_read_editor_cfg($cfgFile);
+    $current = $state['list'];
+
+  } elseif (isset($_POST['apply'])) {
+    $checked = isset($_POST['ext']) && is_array($_POST['ext']) ? $_POST['ext'] : [];
+    $customRaw = isset($_POST['custom']) ? trim($_POST['custom']) : '';
+    $customList = array_filter(array_map('trim', preg_split('/[,\r\n]+/', $customRaw)), function ($v) { return $v !== ''; });
+
+    // Keep any extensions that were already present but aren't in our
+    // suggested list (so we never silently drop something you added by hand).
+    $unknownExisting = array_diff($current, array_keys($suggested));
+
+    $final = array_values(array_unique(array_merge($checked, $customList, $unknownExisting)));
+    sort($final);
+
+    $delim  = ($state['delim'] === 'newline') ? "\n" : ",";
+    $newRaw = implode($delim, $final);
+    if ($delim === "\n" && $newRaw !== '') $newRaw .= "\n";
+
+    if (tee_write_editor_cfg($cfgFile, $newRaw)) {
+      $message = "Updated editor.cfg with " . count($final) . " extension(s). Backup written to editor.cfg.bak.";
+    } else {
+      $error = "Failed to write $cfgFile — check flash drive permissions.";
+    }
+    $state   = tee_read_editor_cfg($cfgFile);
+    $current = $state['list'];
+  }
+}
+?>
+<style>
+.tee-wrap{max-width:900px}
+.tee-wrap table{border-collapse:collapse;margin:10px 0}
+.tee-wrap td{padding:4px 10px 4px 0;vertical-align:top}
+.tee-wrap textarea{width:100%;font-family:monospace;font-size:13px}
+.tee-msg{padding:8px 12px;margin:10px 0;border-radius:4px;background:#dff0d8;color:#3c763d}
+.tee-err{padding:8px 12px;margin:10px 0;border-radius:4px;background:#f2dede;color:#a94442}
+.tee-note{font-size:0.9em;opacity:0.8;margin-bottom:14px}
+.tee-restore{padding:4px 0;margin:14px 0}
+.tee-restore .btn{margin-right:8px}
+.tee-restore .tee-note{margin:6px 0 0 0}
+</style>
+
+<div class="tee-wrap">
+<h3>Editable File Types</h3>
+<p class="tee-note">
+Controls which file extensions the built-in <b>File Manager</b> opens in its text
+editor/preview instead of just downloading. This works by editing
+<code><?php echo htmlspecialchars($cfgFile); ?></code> on the flash drive.
+<?php if (!$state['exists']): ?>
+  This file doesn't exist yet on your system — it will be created when you click Apply.
+<?php endif; ?>
+</p>
+
+<?php if ($message): ?><div class="tee-msg"><?php echo htmlspecialchars($message); ?></div><?php endif; ?>
+<?php if ($error): ?><div class="tee-err"><?php echo htmlspecialchars($error); ?></div><?php endif; ?>
+
+<?php
+  $bakFile  = $cfgFile . '.bak';
+  $hasBak   = file_exists($bakFile);
+  $hasOrig  = file_exists($origFile);
+?>
+<div class="tee-restore">
+<form method="POST" style="display:inline">
+  <button type="submit" name="undo_last" value="1" class="btn" <?php echo $hasBak ? '' : 'disabled'; ?>
+    title="<?php echo $hasBak
+      ? 'Restores from editor.cfg.bak (saved ' . htmlspecialchars(date('Y-m-d H:i:s', filemtime($bakFile))) . ')'
+      : 'No editor.cfg.bak yet — created automatically after your first save'; ?>">Undo Last Change</button>
+</form>
+<form method="POST" style="display:inline" onsubmit="return confirm('Restore editor.cfg to its original contents from before this plugin made any changes? Your current settings will be saved to editor.cfg.bak first.');">
+  <button type="submit" name="restore_original" value="1" class="btn" <?php echo $hasOrig ? '' : 'disabled'; ?>
+    title="<?php echo $hasOrig
+      ? 'Restores from editor.cfg.orig (snapshot taken ' . htmlspecialchars(date('Y-m-d H:i:s', filemtime($origFile))) . ')'
+      : 'No editor.cfg.orig snapshot yet'; ?>">Restore Original</button>
+</form>
+</div>
+
+<form method="POST">
+<table>
+<?php foreach ($suggested as $ext => $desc):
+  $isChecked = in_array($ext, $current, true) ? 'checked' : '';
+?>
+<tr>
+  <td><input type="checkbox" name="ext[]" value="<?php echo htmlspecialchars($ext); ?>" <?php echo $isChecked; ?>></td>
+  <td><code>.<?php echo htmlspecialchars($ext); ?></code></td>
+  <td><?php echo htmlspecialchars($desc); ?></td>
+</tr>
+<?php endforeach; ?>
+</table>
+
+<?php
+  $unknown = array_diff($current, array_keys($suggested));
+?>
+<label><b>Additional extensions</b> (comma or newline separated, no dots, e.g. <code>hcl, rules, tf</code>):</label><br>
+<textarea name="custom" rows="2"><?php echo htmlspecialchars(implode(", ", $unknown)); ?></textarea>
+<br><br>
+<button type="submit" name="apply" value="1" class="btn btn-primary">Apply</button>
+</form>
+
+<hr>
+
+<h4>Raw editor.cfg (advanced)</h4>
+<p class="tee-note">
+If your Unraid version expects a different format than what's detected above,
+edit the exact file contents here directly. Whatever you save here is written
+byte-for-byte to <code><?php echo htmlspecialchars($cfgFile); ?></code>.
+</p>
+<form method="POST">
+<textarea name="raw_content" rows="6"><?php echo htmlspecialchars($state['raw']); ?></textarea>
+<br><br>
+<button type="submit" name="raw_save" value="1" class="btn">Save Raw</button>
+</form>
+
+</div>
+]]>
+</INLINE>
+</FILE>
+
+<!-- Post-install message -->
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+echo "-----------------------------------------------------------------"
+echo " text.editor.extensions installed"
+echo " Go to: Settings -> Utilities -> Editable File Types"
+echo " to choose which extensions (json, yaml, etc.) the File Manager"
+echo " will open in its text editor."
+echo "-----------------------------------------------------------------"
+]]>
+</INLINE>
+</FILE>
+
+<!-- Removal: delete the page, keep editor.cfg itself untouched -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+<![CDATA[
+rm -rf "/usr/local/emhttp/plugins/text.editor.extensions"
+rm -rf "/boot/config/plugins/text.editor.extensions"
+echo "text.editor.extensions removed. /boot/config/editor.cfg was left as-is."
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>
